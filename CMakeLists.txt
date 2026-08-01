@@ -13,11 +13,15 @@ add_executable(mtc_node src/mtc_node.cpp)
 ament_target_dependencies(mtc_node moveit_task_constructor_core rclcpp)
 target_compile_features(mtc_node PUBLIC c_std_99 cxx_std_17)
 
-add_executable(mtc_node_air_pickplace src/mtc_node_air_pickplace.cpp)
-ament_target_dependencies(mtc_node_air_pickplace moveit_task_constructor_core rclcpp)
-target_compile_features(mtc_node_air_pickplace PUBLIC c_std_99 cxx_std_17)
+add_executable(mtc_handover_node src/mtc_handover_node.cpp)
+ament_target_dependencies(mtc_handover_node moveit_task_constructor_core rclcpp)
+target_compile_features(mtc_handover_node PUBLIC c_std_99 cxx_std_17)
 
-install(TARGETS mtc_node mtc_node_air_pickplace
+add_executable(mtc_parallel_node src/mtc_parallel_node.cpp)
+ament_target_dependencies(mtc_parallel_node moveit_task_constructor_core rclcpp)
+target_compile_features(mtc_parallel_node PUBLIC c_std_99 cxx_std_17)
+
+install(TARGETS mtc_node mtc_handover_node mtc_parallel_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch
