@@ -49,11 +49,11 @@ void MTCTaskNode::setupPlanningScene()
   stick.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
   // CYLINDER dimensions are [height, radius], in that order -- swap them
   // and you silently get a short fat disc instead of a long thin stick.
-  stick.primitives[0].dimensions = { 0.8, 0.015 };   // 80cm long, 1.5cm radius
+  stick.primitives[0].dimensions = { 0.8, 0.02 };   // 80cm long, 1.5cm radius
 
   geometry_msgs::msg::Pose pose;
-  pose.position.x = 0.2;
-  pose.position.y = -0.4;
+  pose.position.x = 0.3;
+  pose.position.y = -0.3;
   pose.position.z = 0.4;   // stick's own center height off the root frame
   pose.orientation.w = 1.0;  // upright (cylinder's local Z, its long axis, points straight up)
   stick.pose = pose;
@@ -117,11 +117,21 @@ mtc::Task MTCTaskNode::createTask()
   task.add(std::move(stage_state_current));
 
   auto sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+  sampling_planner->setMaxVelocityScalingFactor(0.1);
+  sampling_planner->setMaxAccelerationScalingFactor(0.1);
+
   auto interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+  interpolation_planner->setMaxVelocityScalingFactor(0.1);   // was previously unset -- this is very
+  interpolation_planner->setMaxAccelerationScalingFactor(0.1); //   likely why "hands_up" felt sudden
+                                                                 //   on real hardware: every other
+                                                                 //   planner here now matches your
+                                                                 //   joint_limits.yaml's conservative
+                                                                 //   0.1 default, this one didn't
 
   auto cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-  cartesian_planner->setMaxVelocityScalingFactor(0.3);
-  cartesian_planner->setMaxAccelerationScalingFactor(0.3);
+  cartesian_planner->setMaxVelocityScalingFactor(0.1);   // lowered from 0.3 -- match the others for
+  cartesian_planner->setMaxAccelerationScalingFactor(0.1); //   now, on real hardware; raise together
+                                                             //   once you trust the whole sequence
   cartesian_planner->setStepSize(.01);
 
   // ----- move away from the singular "home" pose first -----
@@ -140,7 +150,8 @@ mtc::Task MTCTaskNode::createTask()
   }
 
   // ----- open gripper -----
-  auto stage_open_hand = std::make_unique<mtc::stages::MoveTo>("open hand", interpolation_planner);
+  auto stage_open_hand = std::make_unique<mtc::stages::MoveTo>("open hand", sampling_planner);
+  stage_open_hand->setTimeout(5.0);
   stage_open_hand->setGroup(hand_group_name);
   stage_open_hand->setGoal("open");
   task.add(std::move(stage_open_hand));
@@ -212,9 +223,15 @@ mtc::Task MTCTaskNode::createTask()
       Eigen::Isometry3d grasp_frame_transform = Eigen::Isometry3d::Identity();
       grasp_frame_transform.linear() =
           Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitY()).toRotationMatrix();
-      grasp_frame_transform.translation().z() = 0.15;  // this is the value that got you from 0/25 to
-                                                          //     7/25 successful IK -- real evidence
-                                                          //     this direction is closer to correct
+      grasp_frame_transform.translation().z() = 0.08;  // reduced from 0.15 -- that value visibly left
+                                                          //     a gap between the gripper and the bar,
+                                                          //     meaning the real fingers sit closer to
+                                                          //     openarm_right_hand's origin than 0.15m.
+                                                          //     Keep shrinking (e.g. 0.06, 0.04) if a
+                                                          //     gap is still visible, or growing it if
+                                                          //     the gripper now clips INTO the bar --
+                                                          //     same empirical iterate-and-watch method
+                                                          //     as every other geometric value here.
 
       auto wrapper = std::make_unique<mtc::stages::ComputeIK>("grasp pose IK", std::move(stage));
       wrapper->setMaxIKSolutions(8);
@@ -239,7 +256,17 @@ mtc::Task MTCTaskNode::createTask()
     {
       auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", interpolation_planner);
       stage->setGroup(hand_group_name);
-      stage->setGoal("closed");   // confirmed SRDF state name -- not "close"
+      // FIXED: was setGoal("closed") -- the named "closed" state is joint
+      // value 0.0, fully shut. That's only collision-free with an EMPTY
+      // gripper (which is exactly what "close hand (rest)" below correctly
+      // uses it for). Closing all the way to 0.0 around a real ~2cm-radius
+      // bar is a geometric impossibility -- MoveIt was correctly flagging
+      // that as "Goal state is in collision!", not being overly strict.
+      // Target a partial closure sized to the bar instead. This number is
+      // a starting estimate, not derived from real gripper kinematics --
+      // raise it if the gripper doesn't actually reach the bar, lower it
+      // if this collision comes back.
+      stage->setGoal(std::map<std::string, double>{ { "openarm_right_finger_joint1", 0.025 } });
       grasp->insert(std::move(stage));
     }
 
@@ -272,9 +299,8 @@ mtc::Task MTCTaskNode::createTask()
   // ----- move to place -----
   {
     auto stage_move_to_place = std::make_unique<mtc::stages::Connect>(
-        "move to place",
-        mtc::stages::Connect::GroupPlannerVector{ { arm_group_name, sampling_planner },
-                                                    { hand_group_name, sampling_planner } });
+    	"move to place",
+    	mtc::stages::Connect::GroupPlannerVector{ { arm_group_name, sampling_planner } });
     stage_move_to_place->setTimeout(5.0);
     stage_move_to_place->properties().configureInitFrom(mtc::Stage::PARENT);
     task.add(std::move(stage_move_to_place));
@@ -297,7 +323,8 @@ mtc::Task MTCTaskNode::createTask()
       // width away like the original tutorial's 0.30.
       geometry_msgs::msg::PoseStamped target_pose_msg;
       target_pose_msg.header.frame_id = "stick";
-      target_pose_msg.pose.position.y = 0.15;   // <-- adjust: how far "elsewhere" should be
+      target_pose_msg.pose.position.x = 0.1;   // <-- adjust: how far "elsewhere" should be
+      target_pose_msg.pose.position.y = 0.3;   // <-- adjust: how far "elsewhere" should be
       target_pose_msg.pose.orientation.w = 1.0;
       stage->setPose(target_pose_msg);
       stage->setMonitoredStage(attach_object_stage);
@@ -313,7 +340,8 @@ mtc::Task MTCTaskNode::createTask()
 
     // open gripper
     {
-      auto stage = std::make_unique<mtc::stages::MoveTo>("open hand", interpolation_planner);
+      auto stage = std::make_unique<mtc::stages::MoveTo>("open hand", sampling_planner);
+      stage->setTimeout(5.0);
       stage->setGroup(hand_group_name);
       stage->setGoal("open");
       place->insert(std::move(stage));
@@ -352,6 +380,17 @@ mtc::Task MTCTaskNode::createTask()
     }
 
     task.add(std::move(place));
+  }
+  
+  // ----- close gripper gently before resting at home -----
+  // Without this, the gripper stayed open through "return home", so the
+  // NEXT run's very first gripper motion was open->closed happening
+  // abruptly at the grasp point instead of a calm close while idle here.
+  {
+    auto stage = std::make_unique<mtc::stages::MoveTo>("close hand (rest)", interpolation_planner);
+    stage->setGroup(hand_group_name);
+    stage->setGoal("closed");
+    task.add(std::move(stage));
   }
 
   // ----- return home -----
