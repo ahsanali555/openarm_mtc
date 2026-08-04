@@ -5,14 +5,6 @@
 #include <moveit/task_constructor/stages.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
-// After your existing includes, add:
-#include <moveit/robot_trajectory/robot_trajectory.h>
-#include <moveit_msgs/msg/robot_trajectory.hpp>
-#include <moveit/robot_model_loader/robot_model_loader.h>
-#include <fstream>
-#include <sstream>
-#include <yaml-cpp/yaml.h>
-
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("openarm_mtc_handover_node");
 namespace mtc = moveit::task_constructor;
 
@@ -53,10 +45,6 @@ private:
       const std::shared_ptr<mtc::solvers::CartesianPath>& cartesian_planner,
       const std::shared_ptr<mtc::solvers::JointInterpolationPlanner>& interpolation_planner,
       mtc::Stage* attach_stage);
-
-  void saveSolutionToYaml(
-    const mtc::SolutionBase& solution,
-    const std::string& filepath);
 
   mtc::Task task_;
   rclcpp::Node::SharedPtr node_;
@@ -117,178 +105,14 @@ void MTCTaskNode::doTask()
     RCLCPP_ERROR_STREAM(LOGGER, "Task planning failed");
     return;
   }
+  task_.introspection().publishSolution(*task_.solutions().front());
 
-  // ── Pick the best solution ────────────────────────────────────────────────
-  const auto& solutions = task_.solutions();
-  if (solutions.empty())
-  {
-    RCLCPP_ERROR_STREAM(LOGGER, "No solutions available after planning");
-    return;
-  }
-
-  // solutions() is already sorted best-first by MTC cost function.
-  // front() is the one RViz would highlight in green as "Solution 1".
-  // To use a different solution, index into solutions() — e.g. solutions()[2]
-  // for the third-best. You can also browse them in RViz first and note
-  // which index you want, then set the index here before re-running.
-  const size_t SOLUTION_INDEX = 0;   // ← change this to pick a different one
-  if (SOLUTION_INDEX >= solutions.size())
-  {
-    RCLCPP_ERROR_STREAM(LOGGER,
-      "Requested solution index " << SOLUTION_INDEX 
-      << " but only " << solutions.size() << " solutions exist");
-    return;
-  }
-  const auto& chosen = *solutions[SOLUTION_INDEX];
-
-  // ── Publish to RViz so you can visually confirm before saving ────────────
-  task_.introspection().publishSolution(chosen);
-
-  // ── Prompt: save this solution? ───────────────────────────────────────────
-  // Simple stdin prompt so you can inspect in RViz first, then decide.
-  std::string save_name;
-  std::cout << "\n[MTC] Solution " << SOLUTION_INDEX
-            << " published to RViz. Inspect it now.\n"
-            << "Enter a name to save (or press Enter to skip saving): ";
-  std::getline(std::cin, save_name);
-
-  if (!save_name.empty())
-  {
-    // Strip spaces — filenames shouldn't have them
-    save_name.erase(std::remove_if(save_name.begin(), save_name.end(), ::isspace),
-                    save_name.end());
-    std::string outpath = "trajectories/" + save_name + ".yaml";
-
-    // Create output directory if needed
-    std::filesystem::create_directories("trajectories");
-
-    saveSolutionToYaml(chosen, outpath);
-    RCLCPP_INFO_STREAM(LOGGER, "Solution saved to: " << outpath);
-  }
-  else
-  {
-    RCLCPP_INFO_STREAM(LOGGER, "Skipping save.");
-  }
-
-  // ── Execute ───────────────────────────────────────────────────────────────
-  auto result = task_.execute(chosen);
+  auto result = task_.execute(*task_.solutions().front());
   if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
   {
     RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
     return;
   }
-}
-
-void MTCTaskNode::saveSolutionToYaml(
-    const mtc::SolutionBase& solution,
-    const std::string& filepath)
-{
-  // Groups we care about — must match your MoveIt group names exactly.
-  // The serializer will write a section for each group it finds across
-  // all sub-trajectories. Gripper motions are included automatically
-  // since they're separate stages with their own group.
-  const std::vector<std::string> ARM_GROUPS = {
-    "right_arm", "left_arm", "right_gripper", "left_gripper"
-  };
-
-  // Collect all sub-trajectories from the solution in stage order.
-  // Each sub-trajectory has a group name and a RobotTrajectory.
-  std::vector<moveit_msgs::msg::RobotTrajectory> sub_trajs;
-  std::vector<std::string> stage_names;
-
-  solution.start();  // rewind
-  for (const auto& sub : solution.trajectories())
-  {
-    if (!sub || !sub->trajectory())
-      continue;
-
-    moveit_msgs::msg::RobotTrajectory traj_msg;
-    sub->trajectory()->getRobotTrajectoryMsg(traj_msg);
-
-    // Skip empty or single-point trajectories (e.g. ModifyPlanningScene stages)
-    if (traj_msg.joint_trajectory.points.size() < 2)
-      continue;
-
-    sub_trajs.push_back(traj_msg);
-    stage_names.push_back(sub->comment().empty() ? "unnamed_stage" : sub->comment());
-  }
-
-  if (sub_trajs.empty())
-  {
-    RCLCPP_WARN_STREAM(LOGGER, "Solution has no non-trivial trajectories — nothing saved.");
-    return;
-  }
-
-  // ── Build YAML ────────────────────────────────────────────────────────────
-  YAML::Emitter out;
-  out << YAML::BeginMap;
-
-  // metadata
-  out << YAML::Key << "metadata" << YAML::Value << YAML::BeginMap;
-  out << YAML::Key << "num_stages" << YAML::Value << (int)sub_trajs.size();
-  out << YAML::Key << "source" << YAML::Value << "MTC planned solution (no execution noise)";
-  out << YAML::Key << "execution_order"
-      << YAML::Value << YAML::Flow
-      << YAML::BeginSeq;
-  for (const auto& n : stage_names) out << n;
-  out << YAML::EndSeq;
-  out << YAML::EndMap;
-
-  // one section per stage, in order
-  for (size_t s = 0; s < sub_trajs.size(); ++s)
-  {
-    const auto& jt = sub_trajs[s].joint_trajectory;
-    const std::string& key = stage_names[s];
-
-    out << YAML::Key << key << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "joint_names"
-        << YAML::Value << YAML::Flow << YAML::BeginSeq;
-    for (const auto& jn : jt.joint_names) out << jn;
-    out << YAML::EndSeq;
-
-    out << YAML::Key << "num_points" << YAML::Value << (int)jt.points.size();
-    out << YAML::Key << "points" << YAML::Value << YAML::BeginSeq;
-
-    for (const auto& pt : jt.points)
-    {
-      double t = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9;
-
-      out << YAML::BeginMap;
-      out << YAML::Key << "time_from_start" << YAML::Value << t;
-
-      // positions
-      out << YAML::Key << "positions" << YAML::Value << YAML::Flow << YAML::BeginSeq;
-      for (double v : pt.positions) out << v;
-      out << YAML::EndSeq;
-
-      // velocities (may be empty if planner didn't compute them)
-      out << YAML::Key << "velocities" << YAML::Value << YAML::Flow << YAML::BeginSeq;
-      for (double v : pt.velocities) out << v;
-      out << YAML::EndSeq;
-
-      // accelerations
-      out << YAML::Key << "accelerations" << YAML::Value << YAML::Flow << YAML::BeginSeq;
-      for (double v : pt.accelerations) out << v;
-      out << YAML::EndSeq;
-
-      out << YAML::EndMap;
-    }
-
-    out << YAML::EndSeq;  // points
-    out << YAML::EndMap;  // stage section
-  }
-
-  out << YAML::EndMap;  // root
-
-  // ── Write file ────────────────────────────────────────────────────────────
-  std::ofstream file(filepath);
-  if (!file.is_open())
-  {
-    RCLCPP_ERROR_STREAM(LOGGER, "Could not open file for writing: " << filepath);
-    return;
-  }
-  file << out.c_str();
-  file.close();
 }
 
 std::unique_ptr<mtc::SerialContainer> MTCTaskNode::buildPickContainer(
